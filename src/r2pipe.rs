@@ -138,7 +138,38 @@ impl R2Pipe {
 
     #[cfg(windows)]
     pub fn open() -> Result<R2Pipe, &'static str> {
-        Err("`open()` is not yet supported on windows")
+        use std::os::win::io::FromRawHandle;
+        use std::ptr;
+        use winapi::um::{fileapi, winnt, handleapi, winbase};
+        let f = CString::new(R2Pipe::in_windows_session()
+            .ok_or("Pipe not open, Please run from r2")?
+        );
+        let res = unsafe{
+            let pipe = winapi::CreateFileA(
+                f.as_ptr(),
+                winnt::GENERIC_READ | winnt::GENERIC_WRITE,
+                0,
+                ptr::mut_null(),
+                fileapi::OPEN_EXISTING,
+                0,
+                ptr::mut_null()
+            );
+            if pipe == INVALID_HANDLE_VALUE {
+                return Err("Unable to open r2pipe, perhaps r2 been killed?");
+            }
+            let dw_mode = winbase::PIPE_READMODE_MESSAGE;
+            let success = SetNamedPipeHandleState(
+                pipe,
+                &dw_mode,
+                ptr::mut_null(),
+                ptr::mut_null()
+            );
+            if success == 0 {
+                return Err("winapi's SetNamedPipeHandleState failed");
+            }
+            File::from_raw_handle(pipe)
+        };
+        Ok(R2Pipe::Lang(res))
     }
 
     pub fn cmd(&mut self, cmd: &str) -> Result<String, String> {
