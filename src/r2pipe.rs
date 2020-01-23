@@ -29,6 +29,11 @@ pub struct R2PipeLang {
     write: File,
 }
 
+/// File descriptors to the parent r2 process.
+pub struct R2PipeLangDuplex {
+    duplex: BufReader<File>,
+}
+
 /// Stores descriptors to the spawned r2 process.
 pub struct R2PipeSpawn {
     read: BufReader<process::ChildStdout>,
@@ -64,6 +69,7 @@ pub struct R2PipeSpawnOptions {
 pub enum R2Pipe {
     Pipe(R2PipeSpawn),
     Lang(R2PipeLang),
+    LangDuplex(R2PipeLangDuplex),
     Tcp(R2PipeTcp),
     Http(R2PipeHttp),
 }
@@ -138,44 +144,48 @@ impl R2Pipe {
 
     #[cfg(windows)]
     pub fn open() -> Result<R2Pipe, &'static str> {
-        use std::os::win::io::FromRawHandle;
+        use std::os::windows::io::FromRawHandle;
         use std::ptr;
-        use winapi::um::{fileapi, winnt, handleapi, winbase};
+        use std::ffi::CString;
+        use winapi::um::{fileapi, namedpipeapi, winnt, handleapi, winbase};
         let f = CString::new(R2Pipe::in_windows_session()
             .ok_or("Pipe not open, Please run from r2")?
-        );
+        ).unwrap();
         let res = unsafe{
-            let pipe = winapi::CreateFileA(
+            let pipe = fileapi::CreateFileA(
                 f.as_ptr(),
                 winnt::GENERIC_READ | winnt::GENERIC_WRITE,
                 0,
-                ptr::mut_null(),
+                ptr::null_mut(),
                 fileapi::OPEN_EXISTING,
                 0,
-                ptr::mut_null()
+                ptr::null_mut()
             );
-            if pipe == INVALID_HANDLE_VALUE {
+            if pipe == handleapi::INVALID_HANDLE_VALUE {
                 return Err("Unable to open r2pipe, perhaps r2 been killed?");
             }
-            let dw_mode = winbase::PIPE_READMODE_MESSAGE;
-            let success = SetNamedPipeHandleState(
+            let mut dw_mode = winbase::PIPE_READMODE_MESSAGE;
+            let success = namedpipeapi::SetNamedPipeHandleState(
                 pipe,
-                &dw_mode,
-                ptr::mut_null(),
-                ptr::mut_null()
+                &mut dw_mode,
+                ptr::null_mut(),
+                ptr::null_mut()
             );
             if success == 0 {
                 return Err("winapi's SetNamedPipeHandleState failed");
             }
-            File::from_raw_handle(pipe)
+            R2PipeLangDuplex{
+                duplex: BufReader::new(File::from_raw_handle(pipe))
+            }
         };
-        Ok(R2Pipe::Lang(res))
+        Ok(R2Pipe::LangDuplex(res))
     }
 
     pub fn cmd(&mut self, cmd: &str) -> Result<String, String> {
         match *self {
             R2Pipe::Pipe(ref mut x) => x.cmd(cmd.trim()),
             R2Pipe::Lang(ref mut x) => x.cmd(cmd.trim()),
+            R2Pipe::LangDuplex(ref mut x) => x.cmd(cmd.trim()),
             R2Pipe::Tcp(ref mut x) => x.cmd(cmd.trim()),
             R2Pipe::Http(ref mut x) => x.cmd(cmd.trim()),
         }
@@ -185,6 +195,7 @@ impl R2Pipe {
         match *self {
             R2Pipe::Pipe(ref mut x) => x.cmdj(cmd.trim()),
             R2Pipe::Lang(ref mut x) => x.cmdj(cmd.trim()),
+            R2Pipe::LangDuplex(ref mut x) => x.cmdj(cmd.trim()),
             R2Pipe::Tcp(ref mut x) => x.cmdj(cmd.trim()),
             R2Pipe::Http(ref mut x) => x.cmdj(cmd.trim()),
         }
@@ -194,6 +205,7 @@ impl R2Pipe {
         match *self {
             R2Pipe::Pipe(ref mut x) => x.close(),
             R2Pipe::Lang(ref mut x) => x.close(),
+            R2Pipe::LangDuplex(ref mut x) => x.close(),
             R2Pipe::Tcp(ref mut x) => x.close(),
             R2Pipe::Http(ref mut x) => x.close(),
         }
@@ -380,6 +392,26 @@ impl R2PipeLang {
     pub fn close(&mut self) {
         // self.read.close();
         // self.write.close();
+    }
+}
+
+impl R2PipeLangDuplex {
+    pub fn cmd(&mut self, cmd: &str) -> Result<String, String> {
+        self.duplex.get_mut().write(cmd.as_bytes()).unwrap();
+        let mut res: Vec<u8> = Vec::new();
+        self.duplex.read_until(0u8, &mut res).unwrap();
+        process_result(res)
+    }
+
+    pub fn cmdj(&mut self, cmd: &str) -> Result<Value, String> {
+        let res = self.cmd(cmd)?;
+
+        let v = serde_json::from_str(&res);
+        v.map_err(|e| e.to_string())
+    }
+
+    pub fn close(&mut self) {
+        // self.duplex.close();
     }
 }
 
