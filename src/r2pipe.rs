@@ -144,25 +144,89 @@ impl R2Pipe {
 
     #[cfg(windows)]
     pub fn open() -> Result<R2Pipe, &'static str> {
+        /*
+        // We steal the pipe handle from STDIO because of a handle ownership issue
+        //  error we're dodging: https://stackoverflow.com/questions/14883547
+        //TODO: Investigate "CONIN$" "CONOUT$" 
         use std::os::windows::io::FromRawHandle;
         use std::ptr;
         use std::ffi::CString;
-        use winapi::um::{fileapi, namedpipeapi, winnt, handleapi, winbase};
+        use winapi::um::{processenv, errhandlingapi::GetLastError, fileapi, handleapi, processthreadsapi, winbase, winnt};
+        let path = CString::new(R2Pipe::in_windows_session()
+            .ok_or("Pipe not open, Please run from r2")?
+        ).unwrap();
+        let stdout = unsafe{processenv::GetStdHandle(winbase::STD_OUTPUT_HANDLE)};
+        
+        // 64 is way more than enough for the pipe path
+        const PATH_SIZE: usize = 64;
+        let mut observed_path = vec![0u8; PATH_SIZE];
+        const FILE_NAME_OPENED: winapi::shared::minwindef::DWORD = 0x8;
+        let err1 = 0u8;// unsafe{GetLastError()};
+        let observed_path_len = unsafe{fileapi::GetFinalPathNameByHandleA(
+            stdout,
+            observed_path.as_mut_ptr() as _,
+            PATH_SIZE as u32 - 1, // -1 because the winapi doesn't count null ptr!
+            FILE_NAME_OPENED
+        )};
+        let err2 = unsafe{GetLastError()};
+        println!("WINERRORS: {} {}", err1, err2);
+        observed_path.truncate(observed_path_len as usize);
+        if observed_path != path.into_bytes(){
+            // println!("! echo {:?}", CString::new(observed_path));
+            // println!("Wait what even is my stdout {:?}.", stdout);
+            return Err("R2Pipe env variable invalid. Please don't manually set R2PIPE_PATH.");
+        }
+
+        let mut new_handle = ptr::null_mut();
+        unsafe{
+            let process_pseudohandle = processthreadsapi::GetCurrentProcess();
+            if 0!=handleapi::DuplicateHandle(
+                process_pseudohandle,
+                stdout,
+                process_pseudohandle,
+                &mut new_handle,
+                winnt::GENERIC_READ | winnt::GENERIC_WRITE,
+                0,
+                0
+            ){
+                return Err("Couldn't duplicate R2Pipe handle");
+            }
+        }
+        
+        Ok(R2Pipe::Lang(R2PipeLang{
+            read: BufReader::new(unsafe{File::from_raw_handle(new_handle)}),
+            write: None
+        }))
+        */
+        use std::os::windows::io::FromRawHandle;
+        use std::ptr;
+        use std::ffi::CString;
+        use winapi::um::{fileapi, namedpipeapi, errhandlingapi::GetLastError, winnt, handleapi, winbase};
+        use winapi::shared::winerror;
         let f = CString::new(R2Pipe::in_windows_session()
             .ok_or("Pipe not open, Please run from r2")?
         ).unwrap();
         let res = unsafe{
-            let pipe = fileapi::CreateFileA(
-                f.as_ptr(),
-                winnt::GENERIC_READ | winnt::GENERIC_WRITE,
-                0,
-                ptr::null_mut(),
-                fileapi::OPEN_EXISTING,
-                0,
-                ptr::null_mut()
-            );
-            if pipe == handleapi::INVALID_HANDLE_VALUE {
-                return Err("Unable to open r2pipe, perhaps r2 been killed?");
+            let mut pipe = handleapi::INVALID_HANDLE_VALUE;
+            while pipe==handleapi::INVALID_HANDLE_VALUE{
+                pipe = fileapi::CreateFileA(
+                    f.as_ptr(),
+                    winnt::GENERIC_READ | winnt::GENERIC_WRITE,
+                    0,
+                    ptr::null_mut(),
+                    fileapi::OPEN_EXISTING,
+                    0,
+                    ptr::null_mut()
+                );
+                if pipe == handleapi::INVALID_HANDLE_VALUE {
+                    if GetLastError()!=winerror::ERROR_PIPE_BUSY{
+                        return Err("Couldn't open R2Pipe. Please don't set R2PIPE_PATH manually.");
+                    }
+                }
+                if 0==winbase::WaitNamedPipeA(f.as_ptr(), 20000){
+                    return Err("Couldn't open R2Pipe. 20 second timeout on ERROR_PIPE_BUSY.");
+                }
+                
             }
             let mut dw_mode = winbase::PIPE_READMODE_MESSAGE;
             let success = namedpipeapi::SetNamedPipeHandleState(
@@ -222,10 +286,7 @@ impl R2Pipe {
 
     #[cfg(windows)]
     pub fn in_windows_session() -> Option<String> {
-        match env::var("R2PIPE_PATH") {
-            Ok(val) => Some(format!("\\\\.\\pipe\\{}", val)),
-            Err(_) => None,
-        }
+        env::var("R2PIPE_PATH").ok()
     }
 
     /// Creates a new R2PipeSpawn.
